@@ -55,7 +55,7 @@ class Warehouse(models.Model):
 
         mts_rules = pull_model.search(
             [('location_src_id', '=', warehouse.lot_stock_id.id),
-             ('route_id', '=', warehouse.delivery_route_id.id)])
+             ('route_id', '=', warehouse.delivery_route_id.id)], order='id')  # order to make inactive rule be first
         if not mts_rules:
             raise exceptions.Warning(_(
                 'Can\'t find MTS Rule on the warehouse'))
@@ -81,7 +81,7 @@ class Warehouse(models.Model):
             for pull in res[1]:
                 if pull['location_id'] == location_id:
                     pull_mto_mts = pull.copy()
-                    pull_mto_mts_id = pull_obj.create(pull_mto_mts)
+                    pull_mto_mts_id = self._create_reactivate_rule(pull_mto_mts, pull_obj)
                     pull.update({
                         'action': 'split_procurement',
                         'mto_rule_id': pull_mto_mts_id.id,
@@ -102,22 +102,21 @@ class Warehouse(models.Model):
 
     @api.multi
     def write(self, vals):
-        pull_model = self.env['procurement.rule']
-        if 'mto_mts_management' in vals:
-            if vals.get("mto_mts_management"):
-                for warehouse in self:
-                    if not warehouse.mts_mto_rule_id:
-                        rule_vals = self._get_mts_mto_rule(warehouse)
-                        mts_mto_pull = pull_model.create(rule_vals)
-                        vals['mts_mto_rule_id'] = mts_mto_pull.id
-            else:
-                for warehouse in self:
-                    if warehouse.mts_mto_rule_id:
-                        warehouse.mts_mto_rule_id.unlink()
         res = super(Warehouse, self).write(vals)
         if 'mto_mts_management' in vals:
-            self.with_context({'active_test': False}).change_route(
-                warehouse, new_delivery_step=warehouse.delivery_steps)
+            # (re-)create mts_mto_rule_id only after change_route() in super().write() has updated all the locations
+            self.create_mts_mto_rule(vals['mto_mts_management'])
+            # 1) now call overridden _get_push_pull_rules() with mto_mts_management now set on warehouse.
+            # 2) NB: overridden part of change_route() with mts_mto_rule_id now set on warehouse is not actually needed
+            # here because on change of both mto_mts_management + new_delivery_step the create_mts_mto_rule() above
+            # have already used the latest values of updated change_route() (and most probably created a new rule as old
+            # inactive one wasn't found because of changed new_delivery_step). Overridden part (mts_mto_rule_id update)
+            # is only used when only new_delivery_step is changed (and not mto_mts_management) so this branch here
+            # is not executed, but change_route() is. Note that change_route() is still needed here for above mentioned
+            # _get_push_pull_rules() to produce pull rule to customers of split_procurement type.
+            for warehouse in self:
+                self.with_context({'active_test': False}).change_route(
+                    warehouse, new_delivery_step=warehouse.delivery_steps)
         return res
 
     @api.model
@@ -134,12 +133,38 @@ class Warehouse(models.Model):
     def _handle_renaming(self, warehouse, name, code):
         res = super(Warehouse, self)._handle_renaming(warehouse, name, code)
 
-        if warehouse.mts_mto_rule_id:
-            warehouse.mts_mto_rule_id.name = (
-                warehouse.mts_mto_rule_id.name.replace(
+        mts_mto_rule = warehouse.mts_mto_rule_id
+        if not mts_mto_rule:
+            # mts_mto_rule could've been deactivated & disconnected => find it and rename
+            pull_model = self.env['procurement.rule']
+            rule_vals = self._get_mts_mto_rule(warehouse)
+            mts_mto_rule = self._find_existing_rule(rule_vals, pull_model)
+
+        if mts_mto_rule:
+            mts_mto_rule.name = (
+                mts_mto_rule.name.replace(
                     warehouse.name, name, 1)
             )
         return res
+
+    def create_mts_mto_rule(self, mto_mts_management):
+        """ (re-)create mts_mto_rule_id only after change_route() has updated all the locations.
+            otherwise we cannot use _create_reactivate_rule() to find & use existing inactive rule """
+        pull_model = self.env['procurement.rule']
+        if mto_mts_management:
+            for warehouse in self:
+                if not warehouse.mts_mto_rule_id:
+                    rule_vals = self._get_mts_mto_rule(warehouse)
+                    mts_mto_pull = self._create_reactivate_rule(rule_vals, pull_model)
+                    warehouse.mts_mto_rule_id = mts_mto_pull
+        else:
+            for warehouse in self:
+                if warehouse.mts_mto_rule_id:
+                    # don't delete rule, but 1) deactivate it to find & reuse when MTO+MTS re-enabled again, and
+                    # 2) disconnect it to avoid updating inactive rule in change_route(), and to reconnect it above when
+                    # asked, and to avoid its possible usages in flows
+                    warehouse.mts_mto_rule_id.active = False
+                    warehouse.mts_mto_rule_id = False
 
     @api.multi
     def change_route(self, warehouse, new_reception_step=False,
@@ -156,6 +181,6 @@ class Warehouse(models.Model):
                 warehouse.mto_pull_id.location_id)
             mts_rules = pull_model.search(
                 [('location_src_id', '=', warehouse.lot_stock_id.id),
-                 ('route_id', '=', warehouse.delivery_route_id.id)])
+                 ('route_id', '=', warehouse.delivery_route_id.id)], order='id')  # order to make inactive rule be first (not used probably, just for consistency with _get_mts_mto_rule() - ideally should be extracted into a method)
             warehouse.mts_mto_rule_id.mts_rule_id = mts_rules[0].id
         return res
